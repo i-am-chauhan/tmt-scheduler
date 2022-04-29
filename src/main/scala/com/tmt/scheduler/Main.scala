@@ -1,28 +1,29 @@
 package com.tmt.scheduler
 
-import java.time
-import java.time.Instant
+import java.time.{Duration, Instant}
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.locks.LockSupport
 import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.duration.Duration
-import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future}
+import scala.concurrent.{
+  ExecutionContext,
+  ExecutionContextExecutorService,
+  Future
+}
 
 trait Cancellable {
   def cancel(): Unit
 }
 
-case class ScanTask(runnable: () => Future[Any], interval: Int) {
+case class ScanTask(runnable: () => Any, interval: Int) {
   private var _waitTicks: Int = 0
 
-  def waitTicks: Int =  { _waitTicks }
-  def decWaitTicks(): Unit =  { _waitTicks -= 1 }
-  def resetWaitTicks(): Unit =  { _waitTicks = interval }
+  def waitTicks: Int = synchronized { _waitTicks }
+  def decWaitTicks(): Unit = synchronized { _waitTicks -= 1 }
+  def resetWaitTicks(): Unit = synchronized { _waitTicks = interval }
 }
 
-class TimeScheduler {
+class TimeScheduler()(implicit ec: ExecutionContextExecutorService) {
 
   private var stop: Boolean = false
   private var tasks: Map[UUID, ScanTask] = Map.empty
@@ -30,16 +31,19 @@ class TimeScheduler {
   private val thread = new Thread(() => start())
   thread.start()
 
-  def shutdown(): Unit =  { stop = true }
+  def shutdown(): Unit = synchronized {
+    stop = true
+    ec.shutdown()
+  }
 
   private def registerTask(
-      task: () => Future[Unit],
+      task: () => Unit,
       interval: Int
-  ): Cancellable =  {
+  ): Cancellable = synchronized {
     val id: UUID = UUID.randomUUID()
     val scanTask = ScanTask(task, interval)
     tasks = tasks + (id -> scanTask)
-    () => { tasks = tasks - id }
+    () => synchronized { tasks = tasks - id }
   }
 
   private def start(): Unit = {
@@ -48,7 +52,7 @@ class TimeScheduler {
       while (it.hasNext) {
         val task = it.next()._2
         if (task.waitTicks == 0) {
-          task.runnable()
+          Future { task.runnable() }
           task.resetWaitTicks()
         }
         task.decWaitTicks()
@@ -58,59 +62,54 @@ class TimeScheduler {
   }
 
   private def tick(): Unit = {
-
     val oneMilliInNanos = 1000 * 1000
-//    val sleepIntervalInNano = oneMilliInNanos - System.nanoTime() % oneMilliInNanos
-    val sleepIntervalInNano = oneMilliInNanos - Instant.now().getNano % oneMilliInNanos
+    val sleepIntervalInNano =
+      oneMilliInNanos - Instant.now().getNano % oneMilliInNanos
     LockSupport.parkNanos(sleepIntervalInNano)
-//    val startTime = System.nanoTime()
-//    while (startTime + oneMilliInNanos >= System.nanoTime()){}
   }
 
-  def schedule(intervalInMillis: Int)(task: () => Future[Unit]): Cancellable = {
+  def schedule(intervalInMillis: Int)(task: () => Unit): Cancellable = {
     registerTask(task, intervalInMillis)
   }
 }
 
 object Main extends App {
 
-  private val times10ms: ArrayBuffer[Instant] = mutable.ArrayBuffer.empty
-  private val times100ms: ArrayBuffer[Instant] = mutable.ArrayBuffer.empty
-
-  private val scheduler = new TimeScheduler
-
   private implicit val executorService: ExecutionContextExecutorService =
     ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(8))
+  private val scheduler = new TimeScheduler()
 
-//  (0 to 20).map(x =>
-//    scheduler.schedule(10) { () =>
-//      Future {
-//        println(s"Hello $x")
-//      }
-//    }
-//  )
+  var readings = mutable.Map.empty[String, mutable.ArrayBuffer[Long]]
 
-  var count = 0
-  scheduler.schedule(10)(() => {
-    Future.successful {
-        if (count > 60) times10ms.append(Instant.now())
-        count += 1
+  List(
+    ("1-ms-task-A", 1),
+    ("1-ms-task-B", 1),
+    ("10-ms-task-A", 10),
+    ("10-ms-task-B", 10),
+    ("100-ms-task-A", 100),
+    ("100-ms-task-B", 100),
+    ("1000-ms-task-A", 1000),
+    ("1000-ms-task-B", 1000)
+  ).foreach { case (str, i) =>
+    val jittersInMicros = mutable.ArrayBuffer.empty[Long]
+    var startTime = Instant.now()
+    readings.update(str, jittersInMicros)
+    scheduler.schedule(i) { () =>
+      synchronized {
+        val diff = Duration.between(startTime, Instant.now()).abs().toNanos
+        jittersInMicros += Math.round(diff.toDouble / 1000)
+        startTime = Instant.now().plusNanos(i * 1000 * 1000)
+      }
     }
-  })
+  }
 
-  Thread.sleep(30000)
-//  a.cancel()
-//  b.cancel()
+  Thread.sleep(60000)
   scheduler.shutdown()
-  executorService.shutdown()
-//  println("*************************")
-//  println(count)
-  times10ms.reduce((prev, curr) => {
-    val nanos = time.Duration.between(prev, curr).toNanos
-    println("jitter in nanos " + nanos)
-    curr
-  })
-//  println(
-//    times100ms.map(x => s"${x.getEpochSecond} ${x.getNano}").mkString("\n")
-//  )
+
+  readings.foreach { case (str, value) =>
+    val jitterInMicros = value.sum / value.length
+    println(
+      s"$str : jitter = $jitterInMicros microsecs (${jitterInMicros.toDouble / 1000} ms)"
+    )
+  }
 }
